@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Flappy Bird - Canvas Game</title>
+<style>
+  /* ==================== STYLE DASAR ==================== */
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    height: 100%;
+    background: #1a1a2e;
+    overflow: hidden;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    touch-action: manipulation;
+    user-select: none;
+  }
+
+  #gameContainer {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  canvas {
+    display: block;
+    background: #70c5ce;
+    box-shadow: 0 0 40px rgba(0,0,0,0.5);
+    max-width: 100vw;
+    max-height: 100vh;
+    cursor: pointer;
+  }
+
+  /* Overlay UI (start / game over) digambar di canvas, tapi kita
+     tambahkan footer kecil untuk kredit / info responsif */
+  #hint {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.6);
+    font-size: 12px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="gameContainer">
+  <canvas id="gameCanvas"></canvas>
+  <div id="hint">Klik / Tap / Spasi untuk melompat</div>
+</div>
+
+<script>
+/* =========================================================================
+   FLAPPY BIRD - SINGLE FILE GAME
+   Struktur kode:
+   1. SETUP           -> canvas, ukuran, konstanta konfigurasi
+   2. AUDIO            -> beep sederhana via Web Audio API
+   3. STATE            -> objek state global game
+   4. ENTITAS          -> Bird, Pipe, Cloud, Particle (physics & data)
+   5. INPUT HANDLING   -> mouse, touch, keyboard
+   6. UPDATE (PHYSICS) -> gravitasi, gerak, collision detection
+   7. RENDER           -> gambar semua elemen ke canvas
+   8. GAME LOOP        -> requestAnimationFrame loop utama
+   ========================================================================= */
+
+/* ==================== 1. SETUP ==================== */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// Ukuran dasar game (logical resolution), akan di-scale agar responsive
+const BASE_WIDTH = 400;
+const BASE_HEIGHT = 640;
+canvas.width = BASE_WIDTH;
+canvas.height = BASE_HEIGHT;
+
+// ---- KONFIGURASI GAME (silakan diubah untuk tuning) ----
+const CONFIG = {
+  gravity: 0.45,          // percepatan gravitasi per frame
+  jumpVelocity: -8,       // kecepatan lompat (negatif = ke atas)
+  maxFallSpeed: 10,       // batas kecepatan jatuh maksimum
+
+  birdX: BASE_WIDTH * 0.28,
+  birdRadius: 14,         // radius collision burung (lingkaran)
+  birdW: 34,
+  birdH: 26,
+
+  pipeWidth: 60,
+  pipeGapBase: 165,       // celah pipa di awal (mudah)
+  pipeGapMin: 120,        // celah minimum saat skor tinggi (makin sulit)
+  pipeSpeedBase: 2.3,     // kecepatan pipa di awal
+  pipeSpeedMax: 4.2,      // kecepatan pipa maksimum
+  pipeSpawnDistance: 220, // jarak horizontal antar pipa
+
+  groundHeight: 80,
+  skyTop: 0,
+
+  colors: {
+    skyTop: '#4ec0e9',
+    skyBottom: '#a4e3f0',
+    ground: '#ded895',
+    groundStripe: '#c8bf6f',
+    pipeBody: '#73c74b',
+    pipeBodyDark: '#4f9c33',
+    pipeEdge: '#5aa83c',
+    bird: '#ffcc33',
+    birdWing: '#f7a531'
+  }
+};
+
+/* ==================== 2. AUDIO (Web Audio API beep) ==================== */
+const AudioFX = (() => {
+  let ctxAudio = null;
+  function getCtx() {
+    if (!ctxAudio) {
+      ctxAudio = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    return ctxAudio;
+  }
+  // Bunyikan nada sederhana dengan envelope singkat
+  function beep(freq, duration, type = 'sine', volume = 0.18) {
+    try {
+      const ac = getCtx();
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(volume, ac.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(ac.destination);
+      osc.start();
+      osc.stop(ac.currentTime + duration);
+    } catch (e) { /* audio tidak tersedia, abaikan */ }
+  }
+  return {
+    jump: () => beep(520, 0.12, 'square', 0.12),
+    score: () => beep(880, 0.15, 'sine', 0.15),
+    hit:   () => beep(140, 0.35, 'sawtooth', 0.2),
+    // Panggilan pertama untuk "unlock" audio context di mobile (harus dari gesture user)
+    unlock: () => { try { getCtx().resume(); } catch(e){} }
+  };
+})();
+
+/* ==================== 3. STATE ==================== */
+const STATE = {
+  MENU: 'MENU',
+  PLAYING: 'PLAYING',
+  GAMEOVER: 'GAMEOVER'
+};
+
+let gameState = STATE.MENU;
+let score = 0;
+let highScore = parseInt(localStorage.getItem('flappyHighScore') || '0', 10);
+let frameCount = 0;
+let animTime = 0; // waktu untuk animasi kepakan sayap, dsb.
+
+/* ==================== 4. ENTITAS ==================== */
+
+// ---- Bird (burung yang dikontrol pemain) ----
+const bird = {
+  x: CONFIG.birdX,
+  y: BASE_HEIGHT / 2,
+  velocity: 0,
+  rotation: 0,
+  wingAngle: 0,
+  wingDir: 1,
+
+  reset() {
+    this.y = BASE_HEIGHT / 2;
+    this.velocity = 0;
+    this.rotation = 0;
+  },
+
+  flap() {
+    this.velocity = CONFIG.jumpVelocity;
+    AudioFX.jump();
+  },
+
+  update() {
+    // --- physics: gravitasi ---
+    this.velocity += CONFIG.gravity;
+    if (this.velocity > CONFIG.maxFallSpeed) this.velocity = CONFIG.maxFallSpeed;
+    this.y += this.velocity;
+
+    // --- rotasi mengikuti arah gerak ---
+    // saat naik (velocity negatif) -> miring ke atas
+    // saat jatuh (velocity positif) -> miring ke bawah
+    const targetRotation = clamp(this.velocity / 10, -0.5, 1.2);
+    this.rotation += (targetRotation - this.rotation) * 0.25;
+
+    // --- animasi kepakan sayap ---
+    this.wingAngle += 0.25 * this.wingDir;
+    if (this.wingAngle > 0.6 || this.wingAngle < -0.6) this.wingDir *= -1;
+  }
+};
+
+// ---- Pipes (array pasangan pipa atas & bawah) ----
+let pipes = [];
+
+function currentPipeGap() {
+  // gap mengecil seiring skor bertambah, tapi tidak kurang dari pipeGapMin
+  const reduced = CONFIG.pipeGapBase - score * 1.5;
+  return Math.max(CONFIG.pipeGapMin, reduced);
+}
+
+function currentPipeSpeed() {
+  // kecepatan bertambah seiring skor, dibatasi pipeSpeedMax
+  const increased = CONFIG.pipeSpeedBase + score * 0.04;
+  return Math.min(CONFIG.pipeSpeedMax, increased);
+}
+
+function spawnPipe() {
+  const gap = currentPipeGap();
+  const minTop = 60;
+  const maxTop = BASE_HEIGHT - CONFIG.groundHeight - gap - 60;
+  const topHeight = Math.random() * (maxTop - minTop) + minTop;
+
+  pipes.push({
+    x: BASE_WIDTH + CONFIG.pipeWidth,
+    topHeight: topHeight,
+    gap: gap,
+    passed: false
+  });
+}
+
+function updatePipes() {
+  const speed = currentPipeSpeed();
+
+  // spawn pipa baru berdasarkan jarak, bukan hanya frame count, agar konsisten
+  if (pipes.length === 0 || pipes[pipes.length - 1].x < BASE_WIDTH - CONFIG.pipeSpawnDistance) {
+    spawnPipe();
+  }
+
+  for (let i = pipes.length - 1; i >= 0; i--) {
+    const p = pipes[i];
+    p.x -= speed;
+
+    // cek skor: burung berhasil melewati pipa
+    if (!p.passed && p.x + CONFIG.pipeWidth < bird.x - CONFIG.birdRadius) {
+      p.passed = true;
+      score++;
+      AudioFX.score();
+    }
+
+    // hapus pipa yang sudah keluar layar
+    if (p.x < -CONFIG.pipeWidth) {
+      pipes.splice(i, 1);
+    }
+  }
+}
+
+// ---- Clouds (parallax background) ----
+let clouds = [];
+function initClouds() {
+  clouds = [];
+  for (let i = 0; i < 5; i++) {
+    clouds.push({
+      x: Math.random() * BASE_WIDTH,
+      y: 40 + Math.random() * 180,
+      scale: 0.6 + Math.random() * 0.8,
+      speed: 0.2 + Math.random() * 0.3
+    });
+  }
+}
+
+function updateClouds() {
+  for (const c of clouds) {
+    c.x -= c.speed;
+    if (c.x < -80) {
+      c.x = BASE_WIDTH + 80;
+      c.y = 40 + Math.random() * 180;
+    }
+  }
+}
+
+// ---- Particles (efek saat game over) ----
+let particles = [];
+function spawnParticles(x, y) {
+  particles = [];
+  for (let i = 0; i < 24; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 3.5;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 1,
+      life: 1,
+      size: 2 + Math.random() * 3,
+      color: Math.random() > 0.5 ? CONFIG.colors.bird : '#ff5555'
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vy += 0.15; // gravitasi ringan untuk partikel
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life -= 0.02;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+/* ==================== helper ==================== */
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+/* ==================== 5. INPUT HANDLING ==================== */
+function handleInput() {
+  AudioFX.unlock(); // pastikan audio context aktif (perlu gesture user)
+
+  if (gameState === STATE.MENU) {
+    startGame();
+  } else if (gameState === STATE.PLAYING) {
+    bird.flap();
+  } else if (gameState === STATE.GAMEOVER) {
+    // beri jeda singkat agar tidak langsung restart karena tap yang sama
+    if (frameCount - gameOverFrame > 20) {
+      resetGame();
+    }
+  }
+}
+
+canvas.addEventListener('mousedown', (e) => { e.preventDefault(); handleInput(); });
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); handleInput(); }, { passive: false });
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') {
+    e.preventDefault();
+    handleInput();
+  }
+});
+
+/* ==================== 6. UPDATE (PHYSICS & LOGIC) ==================== */
+let gameOverFrame = 0;
+
+function startGame() {
+  gameState = STATE.PLAYING;
+  score = 0;
+  pipes = [];
+  bird.reset();
+}
+
+function resetGame() {
+  gameState = STATE.MENU;
+  bird.reset();
+  pipes = [];
+  particles = [];
+}
+
+function triggerGameOver() {
+  gameState = STATE.GAMEOVER;
+  gameOverFrame = frameCount;
+  AudioFX.hit();
+  spawnParticles(bird.x, bird.y);
+
+  if (score > highScore) {
+    highScore = score;
+    localStorage.setItem('flappyHighScore', String(highScore));
+  }
+}
+
+// ---- Collision Detection ----
+function checkCollisions() {
+  // Tabrakan dengan tanah
+  if (bird.y + CONFIG.birdRadius > BASE_HEIGHT - CONFIG.groundHeight) {
+    bird.y = BASE_HEIGHT - CONFIG.groundHeight - CONFIG.birdRadius;
+    triggerGameOver();
+    return;
+  }
+  // Tabrakan dengan langit-langit
+  if (bird.y - CONFIG.birdRadius < CONFIG.skyTop) {
+    bird.y = CONFIG.skyTop + CONFIG.birdRadius;
+    bird.velocity = 0;
+  }
+
+  // Tabrakan dengan pipa (circle vs rectangle, presisi menggunakan closest point)
+  for (const p of pipes) {
+    const pipeLeft = p.x;
+    const pipeRight = p.x + CONFIG.pipeWidth;
+
+    // hanya cek jika burung berada dalam rentang horizontal pipa
+    if (bird.x + CONFIG.birdRadius > pipeLeft && bird.x - CONFIG.birdRadius < pipeRight) {
+      const topPipeBottom = p.topHeight;
+      const bottomPipeTop = p.topHeight + p.gap;
+
+      // cek collision dengan pipa atas
+      if (circleRectCollide(bird.x, bird.y, CONFIG.birdRadius, pipeLeft, 0, CONFIG.pipeWidth, topPipeBottom)) {
+        triggerGameOver();
+        return;
+      }
+      // cek collision dengan pipa bawah
+      if (circleRectCollide(bird.x, bird.y, CONFIG.birdRadius, pipeLeft, bottomPipeTop, CONFIG.pipeWidth, BASE_HEIGHT - CONFIG.groundHeight - bottomPipeTop)) {
+        triggerGameOver();
+        return;
+      }
+    }
+  }
+}
+
+// Deteksi tabrakan lingkaran (burung) vs persegi (pipa) — akurat menggunakan closest point
+function circleRectCollide(cx, cy, r, rx, ry, rw, rh) {
+  const closestX = clamp(cx, rx, rx + rw);
+  const closestY = clamp(cy, ry, ry + rh);
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  return (dx * dx + dy * dy) < (r * r);
+}
+
+function update() {
+  frameCount++;
+  animTime += 0.05;
+  updateClouds();
+
+  if (gameState === STATE.PLAYING) {
+    bird.update();
+    updatePipes();
+    checkCollisions();
+  } else if (gameState === STATE.GAMEOVER) {
+    updateParticles();
+    // burung tetap jatuh sedikit ke tanah setelah game over untuk efek dramatis
+    if (bird.y + CONFIG.birdRadius < BASE_HEIGHT - CONFIG.groundHeight) {
+      bird.velocity += CONFIG.gravity;
+      bird.y += bird.velocity;
+      bird.rotation = clamp(bird.rotation + 0.05, -0.5, 1.5);
+    }
+  }
+}
+
+/* ==================== 7. RENDER ==================== */
+
+function drawBackground() {
+  // gradient langit
+  const grad = ctx.createLinearGradient(0, 0, 0, BASE_HEIGHT - CONFIG.groundHeight);
+  grad.addColorStop(0, CONFIG.colors.skyTop);
+  grad.addColorStop(1, CONFIG.colors.skyBottom);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, BASE_WIDTH, BASE_HEIGHT);
+}
+
+function drawClouds() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  for (const c of clouds) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.scale(c.scale, c.scale);
+    drawCloudShape();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawCloudShape() {
+  ctx.beginPath();
+  ctx.arc(0, 0, 18, 0, Math.PI * 2);
+  ctx.arc(20, -8, 14, 0, Math.PI * 2);
+  ctx.arc(22, 6, 16, 0, Math.PI * 2);
+  ctx.arc(-18, 5, 14, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawPipes() {
+  for (const p of pipes) {
+    const bottomPipeTop = p.topHeight + p.gap;
+    const bottomHeight = BASE_HEIGHT - CONFIG.groundHeight - bottomPipeTop;
+
+    drawPipeSegment(p.x, 0, CONFIG.pipeWidth, p.topHeight, true);
+    drawPipeSegment(p.x, bottomPipeTop, CONFIG.pipeWidth, bottomHeight, false);
+  }
+}
+
+// Menggambar satu segmen pipa dengan efek 3D ringan (highlight + shadow + bibir pipa)
+function drawPipeSegment(x, y, w, h, isTop) {
+  const capH = 26;
+
+  // badan pipa dengan gradient agar terlihat 3D
+  const grad = ctx.createLinearGradient(x, 0, x + w, 0);
+  grad.addColorStop(0, CONFIG.colors.pipeBodyDark);
+  grad.addColorStop(0.15, CONFIG.colors.pipeBody);
+  grad.addColorStop(0.85, CONFIG.colors.pipeBody);
+  grad.addColorStop(1, CONFIG.colors.pipeBodyDark);
+  ctx.fillStyle = grad;
+  ctx.fillRect(x, y, w, h);
+
+  // outline
+  ctx.strokeStyle = CONFIG.colors.pipeEdge;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
+
+  // bibir pipa (cap) - sedikit lebih lebar, di ujung yang menghadap gap
+  const capY = isTop ? y + h - capH : y;
+  const capGrad = ctx.createLinearGradient(x - 4, 0, x + w + 4, 0);
+  capGrad.addColorStop(0, CONFIG.colors.pipeBodyDark);
+  capGrad.addColorStop(0.15, CONFIG.colors.pipeBody);
+  capGrad.addColorStop(0.85, CONFIG.colors.pipeBody);
+  capGrad.addColorStop(1, CONFIG.colors.pipeBodyDark);
+  ctx.fillStyle = capGrad;
+  ctx.fillRect(x - 4, capY, w + 8, capH);
+  ctx.strokeRect(x - 4, capY, w + 8, capH);
+
+  // highlight tipis di sisi kiri untuk kesan cahaya
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillRect(x + 4, y, 5, h);
+}
+
+function drawGround() {
+  const gy = BASE_HEIGHT - CONFIG.groundHeight;
+  ctx.fillStyle = CONFIG.colors.ground;
+  ctx.fillRect(0, gy, BASE_WIDTH, CONFIG.groundHeight);
+
+  // garis-garis tanah bergerak (efek scroll) mengikuti kecepatan pipa
+  ctx.fillStyle = CONFIG.colors.groundStripe;
+  const stripeW = 20;
+  const offset = (frameCount * currentPipeSpeed()) % stripeW;
+  for (let x = -offset; x < BASE_WIDTH; x += stripeW) {
+    ctx.fillRect(x, gy, stripeW / 2, 8);
+  }
+
+  // garis batas atas tanah
+  ctx.strokeStyle = '#a89b52';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(0, gy);
+  ctx.lineTo(BASE_WIDTH, gy);
+  ctx.stroke();
+}
+
+function drawBird() {
+  ctx.save();
+  ctx.translate(bird.x, bird.y);
+  ctx.rotate(bird.rotation);
+
+  // badan burung (oval kuning)
+  ctx.fillStyle = CONFIG.colors.bird;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, CONFIG.birdW / 2, CONFIG.birdH / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#e0a415';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // sayap (animasi kepakan menggunakan wingAngle)
+  ctx.save();
+  ctx.translate(-4, 2);
+  ctx.rotate(bird.wingAngle);
+  ctx.fillStyle = CONFIG.colors.birdWing;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 10, 6, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // mata
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(8, -4, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#333';
+  ctx.beginPath();
+  ctx.arc(10, -4, 2.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // paruh
+  ctx.fillStyle = '#ff8c1a';
+  ctx.beginPath();
+  ctx.moveTo(13, 1);
+  ctx.lineTo(24, 3);
+  ctx.lineTo(13, 7);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(p.life, 0);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawScore() {
+  ctx.save();
+  ctx.font = 'bold 42px Arial';
+  ctx.textAlign = 'center';
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = '#4f9c33';
+  ctx.fillStyle = '#ffffff';
+  ctx.strokeText(score, BASE_WIDTH / 2, 70);
+  ctx.fillText(score, BASE_WIDTH / 2, 70);
+  ctx.restore();
+}
+
+function drawPanel(x, y, w, h) {
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  roundRect(x, y, w, h, 16);
+  ctx.fill();
+  ctx.strokeStyle = '#dcae4b';
+  ctx.lineWidth = 4;
+  roundRect(x, y, w, h, 16);
+  ctx.stroke();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawMenuScreen() {
+  ctx.save();
+  ctx.textAlign = 'center';
+
+  // Judul dengan efek bounce ringan
+  const bounce = Math.sin(animTime * 1.5) * 6;
+  ctx.font = 'bold 40px Arial';
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#e07a1f';
+  ctx.lineWidth = 5;
+  ctx.strokeText('FLAPPY BIRD', BASE_WIDTH / 2, 180 + bounce);
+  ctx.fillText('FLAPPY BIRD', BASE_WIDTH / 2, 180 + bounce);
+
+  // instruksi
+  ctx.font = 'bold 20px Arial';
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#4f9c33';
+  ctx.lineWidth = 3;
+  const pulse = 0.85 + Math.sin(animTime * 3) * 0.15;
+  ctx.globalAlpha = pulse;
+  ctx.strokeText('Tap to Start', BASE_WIDTH / 2, 400);
+  ctx.fillText('Tap to Start', BASE_WIDTH / 2, 400);
+  ctx.globalAlpha = 1;
+
+  ctx.font = '14px Arial';
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fillText('Klik / Spasi / Tap layar untuk melompat', BASE_WIDTH / 2, 430);
+
+  ctx.font = 'bold 16px Arial';
+  ctx.fillStyle = '#fff2c2';
+  ctx.fillText('High Score: ' + highScore, BASE_WIDTH / 2, 470);
+
+  ctx.restore();
+}
+
+function drawGameOverScreen() {
+  const panelW = 260;
+  const panelH = 220;
+  const px = (BASE_WIDTH - panelW) / 2;
+  const py = (BASE_HEIGHT - panelH) / 2 - 20;
+
+  drawPanel(px, py, panelW, panelH);
+
+  ctx.save();
+  ctx.textAlign = 'center';
+
+  ctx.font = 'bold 30px Arial';
+  ctx.fillStyle = '#e05a3a';
+  ctx.fillText('GAME OVER', BASE_WIDTH / 2, py + 45);
+
+  ctx.font = 'bold 18px Arial';
+  ctx.fillStyle = '#555';
+  ctx.fillText('Skor', BASE_WIDTH / 2, py + 85);
+  ctx.font = 'bold 34px Arial';
+  ctx.fillStyle = '#333';
+  ctx.fillText(score, BASE_WIDTH / 2, py + 120);
+
+  ctx.font = 'bold 16px Arial';
+  ctx.fillStyle = '#b8860b';
+  const newRecord = score === highScore && score > 0;
+  ctx.fillText((newRecord ? 'REKOR BARU! ' : '') + 'Best: ' + highScore, BASE_WIDTH / 2, py + 150);
+
+  // tombol restart
+  const btnW = 160, btnH = 42;
+  const btnX = BASE_WIDTH / 2 - btnW / 2;
+  const btnY = py + panelH - 10;
+  const pulse = 1 + Math.sin(animTime * 4) * 0.03;
+  ctx.save();
+  ctx.translate(BASE_WIDTH / 2, btnY + btnH / 2);
+  ctx.scale(pulse, pulse);
+  ctx.translate(-BASE_WIDTH / 2, -(btnY + btnH / 2));
+  ctx.fillStyle = '#73c74b';
+  roundRect(btnX, btnY, btnW, btnH, 10);
+  ctx.fill();
+  ctx.strokeStyle = '#4f9c33';
+  ctx.lineWidth = 3;
+  roundRect(btnX, btnY, btnW, btnH, 10);
+  ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 18px Arial';
+  ctx.fillText('Tap to Restart', BASE_WIDTH / 2, btnY + btnH / 2 + 6);
+  ctx.restore();
+
+  ctx.restore();
+}
+
+function render() {
+  drawBackground();
+  drawClouds();
+  drawPipes();
+  drawGround();
+  drawBird();
+
+  if (gameState === STATE.PLAYING) {
+    drawScore();
+  } else if (gameState === STATE.MENU) {
+    drawMenuScreen();
+  } else if (gameState === STATE.GAMEOVER) {
+    drawParticles();
+    drawGameOverScreen();
+  }
+}
+
+/* ==================== 8. GAME LOOP ==================== */
+function gameLoop() {
+  update();
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+/* ==================== RESPONSIVE CANVAS SCALING ==================== */
+function resizeCanvas() {
+  const container = document.getElementById('gameContainer');
+  const availW = window.innerWidth;
+  const availH = window.innerHeight;
+
+  const scale = Math.min(availW / BASE_WIDTH, availH / BASE_HEIGHT);
+  canvas.style.width = (BASE_WIDTH * scale) + 'px';
+  canvas.style.height = (BASE_HEIGHT * scale) + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+
+/* ==================== INISIALISASI ==================== */
+initClouds();
+resizeCanvas();
+gameLoop();
+
+</script>
+</body>
+</html>
